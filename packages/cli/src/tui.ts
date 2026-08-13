@@ -23,6 +23,9 @@ const legacyDefaults: Record<string, unknown> = {
   "/provider": { all: [], default: {}, connected: [] },
   "/agent": [],
   "/config": {},
+  "/path": { state: "", config: "", worktree: "", directory: "" },
+  "/project/current": { id: "global", worktree: "", time: { created: 0 } },
+  "/session": [],
 }
 
 // The TUI still reads these v1 routes, which the v2 daemon does not serve. Empty stubs kept it
@@ -35,7 +38,7 @@ const legacyAdapters: Record<
 > = {
   "/provider": async (origin, directory, headers) => {
     const { providers, connected } = await v1Providers(origin, directory, headers)
-    return { all: providers, default: {}, connected }
+    return { all: providers, default: {}, connected: bridged("connected") ? connected : [] }
   },
   "/config/providers": async (origin, directory, headers) => {
     const { providers } = await v1Providers(origin, directory, headers)
@@ -51,6 +54,45 @@ const legacyAdapters: Record<
       tools: {},
       options: {},
     })),
+  // The project gate: sync refuses to leave the loading state until the path has a worktree.
+  "/path": async (origin, directory, headers) => {
+    const location = (await v2raw(origin, "/api/location", directory, headers)) as any
+    return {
+      state: "",
+      config: "",
+      worktree: location.project?.directory ?? location.directory ?? "",
+      directory: location.directory ?? "",
+    }
+  },
+  "/project/current": async (origin, directory, headers) => {
+    const location = (await v2raw(origin, "/api/location", directory, headers)) as any
+    return {
+      id: location.project?.id ?? "global",
+      worktree: location.project?.directory ?? location.directory ?? "",
+      time: { created: 0 },
+    }
+  },
+  "/session": async (origin, directory, headers) =>
+    ((await v2(origin, "/api/session", directory, headers)) as any[]).map((s) => ({
+      id: s.id,
+      projectID: s.projectID ?? "",
+      directory: s.location?.directory ?? "",
+      title: s.title ?? "",
+      version: "v2",
+      time: { created: epoch(s.time?.created), updated: epoch(s.time?.updated) },
+    })),
+}
+
+const epoch = (value: unknown) =>
+  typeof value === "number" ? value : Date.parse(typeof value === "string" ? value : "") || 0
+
+// Some v2 responses are the object itself, not a data envelope.
+async function v2raw(origin: string, path: string, directory: string | null, headers?: HeadersInit) {
+  const url = new URL(origin + path)
+  if (directory) url.searchParams.set("location[directory]", directory)
+  const response = await fetch(url, { headers })
+  if (!response.ok) throw new Error(`${path} responded ${response.status}`)
+  return response.json()
 }
 
 async function v1Providers(origin: string, directory: string | null, headers?: HeadersInit) {
@@ -117,6 +159,55 @@ function v1Model(m: any) {
   }
 }
 
+// The TUI blocks its first render on the global event stream, one more v1 route. The v2 daemon
+// streams the same v2 event payloads on /api/event without the global envelope, so wrap each
+// frame in the {directory, payload} envelope the TUI reads. Heartbeat comments pass through.
+async function globalEventStream(origin: string, directory: string | null, headers?: HeadersInit) {
+  const upstream = await fetch(`${origin}/api/event`, { headers })
+  if (!upstream.ok || !upstream.body) throw new Error(`/api/event responded ${upstream.status}`)
+  let buffer = ""
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  const transform = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true })
+      for (;;) {
+        const index = buffer.indexOf("\n\n")
+        if (index === -1) break
+        const frame = buffer.slice(0, index)
+        buffer = buffer.slice(index + 2)
+        controller.enqueue(encoder.encode(wrapFrame(frame, directory) + "\n\n"))
+      }
+    },
+  })
+  return new Response(upstream.body.pipeThrough(transform), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  })
+}
+
+function wrapFrame(frame: string, directory: string | null): string {
+  return frame
+    .split("\n")
+    .map((line) => {
+      if (!line.startsWith("data:")) return line
+      try {
+        const payload = JSON.parse(line.slice(5))
+        return (
+          "data: " +
+          JSON.stringify({
+            directory: payload?.location?.directory ?? directory ?? "",
+            workspace: payload?.location?.workspaceID,
+            payload,
+          })
+        )
+      } catch {
+        return line
+      }
+    })
+    .join("\n")
+}
+
 async function v2(origin: string, path: string, directory: string | null, headers?: HeadersInit) {
   const url = new URL(origin + path)
   if (directory) url.searchParams.set("location[directory]", directory)
@@ -126,14 +217,33 @@ async function v2(origin: string, path: string, directory: string | null, header
   return body.data ?? []
 }
 
+// Bisection switch while the bridge stabilizes: a comma list of enabled pieces
+// (providers,list,connected,agents,events,project,session); "off" means stubs only. The default
+// excludes `providers` (/config/providers): populating that store blanks the TUI, cause unknown.
+const BRIDGE = (process.env.OPENCODE_TUI_BRIDGE ?? "list,connected,agents,events,project,session")
+  .split(",")
+  .map((s) => s.trim())
+const bridged = (name: string) => BRIDGE.includes(name)
+
 const gracefulFetch = Object.assign(
   async (input: RequestInfo | URL, init?: RequestInit) => {
     const response = await fetch(input, init)
     const url = new URL(input instanceof Request ? input.url : input)
     if (response.status !== 404) return response
+    if (url.pathname === "/global/event" && bridged("events")) {
+      const headers = init?.headers ?? (input instanceof Request ? input.headers : undefined)
+      const directory = url.searchParams.get("directory") ?? url.searchParams.get("workspace")
+      return globalEventStream(url.origin, directory, headers).catch(() => response)
+    }
     const fallback = legacyDefaults[url.pathname]
     if (fallback === undefined) return response
-    const adapt = legacyAdapters[url.pathname]
+    const enabled =
+      (url.pathname === "/config/providers" && bridged("providers")) ||
+      (url.pathname === "/provider" && bridged("list")) ||
+      (url.pathname === "/agent" && bridged("agents")) ||
+      ((url.pathname === "/path" || url.pathname === "/project/current") && bridged("project")) ||
+      (url.pathname === "/session" && bridged("session"))
+    const adapt = enabled ? legacyAdapters[url.pathname] : undefined
     if (adapt === undefined) return Response.json(fallback)
     // The SDK may carry auth on a Request object rather than in init.
     const headers = init?.headers ?? (input instanceof Request ? input.headers : undefined)
