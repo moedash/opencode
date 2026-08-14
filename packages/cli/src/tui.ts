@@ -62,7 +62,7 @@ const legacyAdapters: Record<
 > = {
   "/provider": async (origin, directory, headers) => {
     const { providers, connected } = await v1Providers(origin, directory, headers)
-    return { all: providers, default: {}, connected: bridged("connected") ? connected : [] }
+    return { all: providers, default: {}, connected }
   },
   "/config/providers": async (origin, directory, headers) => {
     const { providers } = await v1Providers(origin, directory, headers)
@@ -241,33 +241,23 @@ async function v2(origin: string, path: string, directory: string | null, header
   return body.data ?? []
 }
 
-// Bisection switch while the bridge stabilizes: a comma list of enabled pieces
-// (providers,list,connected,agents,events,project,session); "off" means stubs only. The default
-// excludes `providers` (/config/providers): populating that store blanks the TUI, cause unknown.
-const BRIDGE = (process.env.OPENCODE_TUI_BRIDGE ?? "list,connected,agents,events,project,session")
-  .split(",")
-  .map((s) => s.trim())
-const bridged = (name: string) => BRIDGE.includes(name)
-
 const gracefulFetch = Object.assign(
   async (input: RequestInfo | URL, init?: RequestInit) => {
     const response = await fetch(input, init)
     const url = new URL(input instanceof Request ? input.url : input)
     if (response.status !== 404) return response
-    if (url.pathname === "/global/event" && bridged("events")) {
+    if (url.pathname === "/global/event") {
       const headers = init?.headers ?? (input instanceof Request ? input.headers : undefined)
       const directory = url.searchParams.get("directory") ?? url.searchParams.get("workspace")
       return globalEventStream(url.origin, directory, headers).catch(() => response)
     }
+    // Adapters answer reads only; a write (e.g. the v1 POST /session create) must surface its
+    // real 404 rather than receive the GET adapter's body.
+    const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase()
+    if (method !== "GET") return response
     const fallback = legacyDefaults[url.pathname]
     if (fallback === undefined) return response
-    const enabled =
-      (url.pathname === "/config/providers" && bridged("providers")) ||
-      (url.pathname === "/provider" && bridged("list")) ||
-      (url.pathname === "/agent" && bridged("agents")) ||
-      ((url.pathname === "/path" || url.pathname === "/project/current") && bridged("project")) ||
-      (url.pathname === "/session" && bridged("session"))
-    const adapt = enabled ? legacyAdapters[url.pathname] : undefined
+    const adapt = legacyAdapters[url.pathname]
     if (adapt === undefined) return Response.json(fallback)
     // The SDK may carry auth on a Request object rather than in init.
     const headers = init?.headers ?? (input instanceof Request ? input.headers : undefined)
